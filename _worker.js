@@ -6,270 +6,143 @@
 import { connect } from 'cloudflare:sockets';
 
 // How to generate your own UUID:
-// https://www.uuidgenerator.net/
-let userID = '89b3cbba-e6ac-485a-9481-976a0415eab9';
+// [Windows] Press "Win + R", input cmd and run:  Powershell -NoExit -Command "[guid]::NewGuid()"
+let userID = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
 
-// https://www.nslookup.io/domains/cdn.xn--b6gac.eu.org/dns-records/
-// https://www.nslookup.io/domains/cdn-all.xn--b6gac.eu.org/dns-records/
-const proxyIPs= ['cdn.xn--b6gac.eu.org', 'cdn-all.xn--b6gac.eu.org', 'edgetunnel.anycast.eu.org'];
+const proxyIPs = ['cdn.xn--b6gac.eu.org', 'cdn-all.xn--b6gac.eu.org', 'workers.cloudflare.cyou'];
 
+// if you want to use ipv6 or single proxyIP, please add comment at this line and remove comment at the next line
 let proxyIP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
+// use single proxyIP instead of random
+// let proxyIP = 'cdn.xn--b6gac.eu.org';
+// ipv6 proxyIP example remove comment to use
+// let proxyIP = "[2a01:4f8:c2c:123f:64:5:6810:c55a]"
 
-let dohURL = 'https://cloudflare-dns.com/dns-query';
+let dohURL = 'https://sky.rethinkdns.com/1:-Pf_____9_8A_AMAIgE8kMABVDDmKOHTAKg='; // https://cloudflare-dns.com/dns-query or https://dns.google/dns-query
 
 if (!isValidUUID(userID)) {
-    throw new Error('uuid is not valid');
+	throw new Error('uuid is invalid');
 }
 
 export default {
-    /**
-     * @param {import("@cloudflare/workers-types").Request} request
-     * @param {{UUID: string, PROXYIP: string, DNS_RESOLVER_URL: string}} env
-     * @param {import("@cloudflare/workers-types").ExecutionContext} ctx
-     * @returns {Promise<Response>}
-     */
-    async fetch(request, env, ctx) {
-        try {
-            
-            userID = env.UUID || userID;
-            proxyIP = env.PROXYIP || proxyIP;
-            dohURL = env.DNS_RESOLVER_URL || dohURL;
-            const upgradeHeader = request.headers.get('Upgrade');
-            
-            if (!upgradeHeader || upgradeHeader !== 'websocket') {
-                
-                const url = new URL(request.url);
-                const searchParams = new URLSearchParams(url.search);
-                const host = request.headers.get('Host');
-                const client = searchParams.get('app');
-
-                switch (url.pathname) {
-
-                    case '/cf':
-                        return new Response(JSON.stringify(request.cf, null, 4), {
-                            status: 200,
-                            headers: {
-                                'Content-Type': 'application/json;charset=utf-8',
-                            },
-                        });
-
-                    case '/connect': // for test connect to cf socket
-
-                        const [hostname, port] = ['cloudflare.com', '80'];
-                        console.log(`Connecting to ${hostname}:${port}...`);
-
-                        try {
-                            const socket = await connect({
-                                hostname: hostname,
-                                port: parseInt(port, 10),
-                            });
-
-                            const writer = socket.writable.getWriter();
-
-                            try {
-                                await writer.write(
-                                    new TextEncoder().encode(
-                                        'GET / HTTP/1.1\r\nHost: ' + hostname + '\r\n\r\n'
-                                    )
-                                );
-                            } catch (writeError) {
-                                writer.releaseLock();
-                                await socket.close();
-                                return new Response(writeError.message, { status: 500 });
-                            }
-
-                            writer.releaseLock();
-
-                            const reader = socket.readable.getReader();
-                            let value;
-
-                            try {
-                                const result = await reader.read();
-                                value = result.value;
-                            } catch (readError) {
-                                await reader.releaseLock();
-                                await socket.close();
-                                return new Response(readError.message, { status: 500 });
-                            }
-
-                            await reader.releaseLock();
-                            await socket.close();
-
-                            return new Response(new TextDecoder().decode(value), {
-                                status: 200,
-                            });
-                        } catch (connectError) {
-                            return new Response(connectError.message, { status: 500 });
-                        }
-                        
-                    case `/sub/${userID}`:
-
-                        if (client === 'sfa') {
-                            const BestPingSFA = await getSingboxConfig(env, host);
-                            return new Response(`${JSON.stringify(BestPingSFA, null, 4)}`, { status: 200 });                            
-                        }
-                        const normalConfigs = await getNormalConfigs(env, host, client);
-                        return new Response(normalConfigs, { status: 200 });                        
-
-                    case `/fragsub/${userID}`:
-
-                        let fragConfigs = await getFragmentConfigs(env, host, 'v2ray');
-                        fragConfigs = fragConfigs.map(config => config.config);
-
-                        return new Response(`${JSON.stringify(fragConfigs, null, 4)}`, { status: 200 });
-
-                    case '/panel':
-
-                        if (!env.bpb) {
-                            return new Response(errorPage, { status: 200, headers: {'Content-Type': 'text/html'}});
-                        }
-
-                        if (request.method === 'POST') {    
-
-                            if (!(await Authenticate(request, env))) {                            
-                                return new Response('Unauthorized', { status: 401 });  
-                            }
-                            
-                            const formData = await request.formData();
-                            await updateDataset(env, formData);
-
-                            return new Response('Success', { status: 200 });
-                        }
-                            
-
-                        if (!(await Authenticate(request, env))) {
-                            return Response.redirect(`${url.origin}/login`, 302);        
-                        }
-
-                        if (! await env.bpb.get('proxySettings')) {
-                            await updateDataset(env);
-                        }
-
-                        const fragConfs = await getFragmentConfigs(env, host, 'nekoray');                        
-                        const htmlPage = await renderHomePage(env, host, fragConfs);
-
-                        return new Response(htmlPage, {
-                            status: 200,
-                            headers: {
-                                'Content-Type': 'text/html',
-                                'Access-Control-Allow-Origin': url.origin,
-                                'Access-Control-Allow-Methods': 'GET, POST',
-                                'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-                                'X-Content-Type-Options': 'nosniff',
-                                'X-Frame-Options': 'DENY',
-                                'Referrer-Policy': 'strict-origin-when-cross-origin'
-                            }
-                        });
-                                                      
-                    case '/login':
-
-                        if (!env.bpb) {
-                            return new Response(errorPage, { status: 200, headers: {'Content-Type': 'text/html'}});
-                        }
-
-                        if (await Authenticate(request, env)) {
-                            return Response.redirect(`${url.origin}/panel`, 302);       
-                        }
-
-                        let secretKey = await env.bpb.get('secretKey');
-                        let pwd = await env.bpb.get('pwd');
-
-
-                        if (!pwd) {
-                            await env.bpb.put('pwd', 'admin');
-                        }
-
-                        if (!secretKey) {
-                            secretKey = generateSecretKey();
-                            await env.bpb.put('secretKey', secretKey);
-                        }
-
-
-                        if (request.method === 'POST') {
-                            const password = await request.text();
-                            const savedPass = await env.bpb.get('pwd');
-
-                            if (password === savedPass) {
-                                const jwtToken = generateJWTToken(secretKey, password);
-                                const cookieHeader = `jwtToken=${jwtToken}; HttpOnly; Secure; Max-Age=${7 * 24 * 60 * 60}; Path=/; SameSite=Strict`;
-                                
-                                return new Response('Success', {
-                                    status: 200,
-                                    headers: {
-                                      'Set-Cookie': cookieHeader,
-                                      'Content-Type': 'text/plain',
-                                    }
-                                });        
-                            } else {
-                                return new Response('Method Not Allowed', { status: 405 });
-                            }
-                        }
-                        
-                        const loginPage = await renderLoginPage();
-
-                        return new Response(loginPage, {
-                            status: 200,
-                            headers: {
-                                'Content-Type': 'text/html',
-                                'Access-Control-Allow-Origin': url.origin,
-                                'Access-Control-Allow-Methods': 'GET, POST',
-                                'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-                                'X-Content-Type-Options': 'nosniff',
-                                'X-Frame-Options': 'DENY',
-                                'Referrer-Policy': 'strict-origin-when-cross-origin'
-                            }
-                        });
-                    
-                    case '/logout':
-                                    
-                        return new Response('Success', {
-                            status: 200,
-                            headers: {
-                                'Set-Cookie': 'jwtToken=; Secure; SameSite=None; Expires=Thu, 01 Jan 1970 00:00:00 GMT',
-                                'Content-Type': 'text/plain'
-                            }
-                        });        
-
-                    case '/panel/password':
-
-                        if (!(await Authenticate(request, env))) {                            
-                            return new Response('Unauthorized!', { status: 401 });  
-                        }
-                        
-                        const newPwd = await request.text();
-                        const oldPwd = await env.bpb.get('pwd');
-
-                        if (newPwd === oldPwd) {
-                            return new Response('Please enter a new Password!', { status: 400 });
-                        }
-
-                        await env.bpb.put('pwd', newPwd);
-
-                        return new Response('Success', {
-                            status: 200,
-                            headers: {
-                                'Set-Cookie': 'jwtToken=; Path=/; Secure; SameSite=None; Expires=Thu, 01 Jan 1970 00:00:00 GMT',
-                                'Content-Type': 'text/plain',
-                            }
-                        });
-
-                    default:
-                        // return new Response('Not found', { status: 404 });
-                        // For any other path, reverse proxy to 'www.fmprc.gov.cn' and return the original response
-                        url.hostname = 'www.speedtest.net';
-                        url.protocol = 'https:';
-                        request = new Request(url, request);
-                        return await fetch(request);
-                }
-            } else {
-                return await vlessOverWSHandler(request);
-            }
-        } catch (err) {
-            /** @type {Error} */ let e = err;
-            return new Response(e.toString());
-        }
-    },
+	/**
+	 * @param {import("@cloudflare/workers-types").Request} request
+	 * @param {{UUID: string, PROXYIP: string, DNS_RESOLVER_URL: string, NODE_ID: int, API_HOST: string, API_TOKEN: string}} env
+	 * @param {import("@cloudflare/workers-types").ExecutionContext} ctx
+	 * @returns {Promise<Response>}
+	 */
+	async fetch(request, env, ctx) {
+		// uuid_validator(request);
+		try {
+			userID = env.UUID || userID;
+			proxyIP = env.PROXYIP || proxyIP;
+			dohURL = env.DNS_RESOLVER_URL || dohURL;
+			let userID_Path = userID;
+			if (userID.includes(',')) {
+				userID_Path = userID.split(',')[0];
+			}
+			const upgradeHeader = request.headers.get('Upgrade');
+			if (!upgradeHeader || upgradeHeader !== 'websocket') {
+				const url = new URL(request.url);
+				switch (url.pathname) {
+					case `/cf`: {
+						return new Response(JSON.stringify(request.cf, null, 4), {
+							status: 200,
+							headers: {
+								"Content-Type": "application/json;charset=utf-8",
+							},
+						});
+					}
+					case `/${userID_Path}`: {
+						const vlessConfig = getVLESSConfig(userID, request.headers.get('Host'));
+						return new Response(`${vlessConfig}`, {
+							status: 200,
+							headers: {
+								"Content-Type": "text/html; charset=utf-8",
+							}
+						});
+					};
+					case `/sub/${userID_Path}`: {
+						const url = new URL(request.url);
+						const searchParams = url.searchParams;
+						const vlessSubConfig = createVLESSSub(userID, request.headers.get('Host'));
+						// Construct and return response object
+						return new Response(btoa(vlessSubConfig), {
+							status: 200,
+							headers: {
+								"Content-Type": "text/plain;charset=utf-8",
+							}
+						});
+					};
+					case `/bestip/${userID_Path}`: {
+						const headers = request.headers;
+						const url = `https://sub.xf.free.hr/auto?host=${request.headers.get('Host')}&uuid=${userID}&path=/`;
+						const bestSubConfig = await fetch(url, { headers: headers });
+						return bestSubConfig;
+					};
+					default:
+						// return new Response('Not found', { status: 404 });
+						// For any other path, reverse proxy to 'ramdom website' and return the original response, caching it in the process
+						const randomHostname = cn_hostnames[Math.floor(Math.random() * cn_hostnames.length)];
+						const newHeaders = new Headers(request.headers);
+						newHeaders.set('cf-connecting-ip', '1.2.3.4');
+						newHeaders.set('x-forwarded-for', '1.2.3.4');
+						newHeaders.set('x-real-ip', '1.2.3.4');
+						newHeaders.set('referer', 'https://www.google.com/search?q=edtunnel');
+						// Use fetch to proxy the request to 15 different domains
+						const proxyUrl = 'https://' + randomHostname + url.pathname + url.search;
+						let modifiedRequest = new Request(proxyUrl, {
+							method: request.method,
+							headers: newHeaders,
+							body: request.body,
+							redirect: 'manual',
+						});
+						const proxyResponse = await fetch(modifiedRequest, { redirect: 'manual' });
+						// Check for 302 or 301 redirect status and return an error response
+						if ([301, 302].includes(proxyResponse.status)) {
+							return new Response(`Redirects to ${randomHostname} are not allowed.`, {
+								status: 403,
+								statusText: 'Forbidden',
+							});
+						}
+						// Return the response from the proxy server
+						return proxyResponse;
+				}
+			} else {
+				return await vlessOverWSHandler(request);
+			}
+		} catch (err) {
+			/** @type {Error} */ let e = err;
+			return new Response(e.toString());
+		}
+	},
 };
+
+export async function uuid_validator(request) {
+	const hostname = request.headers.get('Host');
+	const currentDate = new Date();
+
+	const subdomain = hostname.split('.')[0];
+	const year = currentDate.getFullYear();
+	const month = String(currentDate.getMonth() + 1).padStart(2, '0');
+	const day = String(currentDate.getDate()).padStart(2, '0');
+
+	const formattedDate = `${year}-${month}-${day}`;
+
+	// const daliy_sub = formattedDate + subdomain
+	const hashHex = await hashHex_f(subdomain);
+	// subdomain string contains timestamps utc and uuid string TODO.
+	console.log(hashHex, subdomain, formattedDate);
+}
+
+export async function hashHex_f(string) {
+	const encoder = new TextEncoder();
+	const data = encoder.encode(string);
+	const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+	const hashArray = Array.from(new Uint8Array(hashBuffer));
+	const hashHex = hashArray.map(byte => byte.toString(16).padStart(2, '0')).join('');
+	return hashHex;
+}
 
 /**
  * Handles VLESS over WebSocket requests by creating a WebSocket pair, accepting the WebSocket connection, and processing the VLESS header.
@@ -325,8 +198,6 @@ async function vlessOverWSHandler(request) {
 			if (hasError) {
 				// controller.error(message);
 				throw new Error(message); // cf seems has bug, controller.error will not end stream
-				// webSocket.close(1000, message);
-				return;
 			}
 
 			// If UDP and not DNS port, close it
@@ -824,1748 +695,251 @@ async function handleUDPOutBound(webSocket, vlessResponseHeader, log) {
 
 /**
  *
- * @param {string} userID
+ * @param {string} userID - single or comma separated userIDs
  * @param {string | null} hostName
  * @returns {string}
  */
+function getVLESSConfig(userIDs, hostName) {
+	const commonUrlPart = `:443?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#${hostName}`;
+	const hashSeparator = "################################################################";
 
-const getNormalConfigs = async (env, hostName, client) => {
-    let vlessWsTls = '';
-    const { cleanIPs } = await env.bpb.get("proxySettings", {type: 'json'});
-    const resolved = await resolveDNS(hostName);
-    const Addresses = [
-        hostName,
-        'www.speedtest.net',
-        ...(cleanIPs ? cleanIPs.split(',') : []),
-        ...resolved.ipv4,
-        ...resolved.ipv6.map((ip) => `[${ip}]`),
-    ];
+	// Split the userIDs into an array
+	const userIDArray = userIDs.split(",");
 
-    Addresses.forEach((addr) => {
-        let remark = `💦 BPB - ${addr}`;
-        remark = remark.length <= 30 ? remark : `${remark.slice(0,29)}...`;
+	// Prepare output string for each userID
+	const output = userIDArray.map((userID) => {
+		const vlessMain = `vless://${userID}@${hostName}${commonUrlPart}`;
+		const vlessSec = `vless://${userID}@${proxyIP}${commonUrlPart}`;
+		return `<h2>UUID: ${userID}</h2>${hashSeparator}\nv2ray default ip
+---------------------------------------------------------------
+${vlessMain}
+<button onclick='copyToClipboard("${vlessMain}")'><i class="fa fa-clipboard"></i> Copy vlessMain</button>
+---------------------------------------------------------------
+v2ray with bestip
+---------------------------------------------------------------
+${vlessSec}
+<button onclick='copyToClipboard("${vlessSec}")'><i class="fa fa-clipboard"></i> Copy vlessSec</button>
+---------------------------------------------------------------`;
+	}).join('\n');
+	const sublink = `https://${hostName}/sub/${userIDArray[0]}?format=clash`
+	const subbestip = `https://${hostName}/bestip/${userIDArray[0]}`;
+	const clash_link = `https://api.v1.mk/sub?target=clash&url=${encodeURIComponent(sublink)}&insert=false&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true`;
+	// Prepare header string
+	const header = `
+<p align='center'><img src='https://cloudflare-ipfs.com/ipfs/bafybeigd6i5aavwpr6wvnwuyayklq3omonggta4x2q7kpmgafj357nkcky' alt='图片描述' style='margin-bottom: -50px;'>
+<b style='font-size: 15px;'>Welcome! This function generates configuration for VLESS protocol. If you found this useful, please check our GitHub project for more:</b>
+<b style='font-size: 15px;'>欢迎！这是生成 VLESS 协议的配置。如果您发现这个项目很好用，请查看我们的 GitHub 项目给我一个star：</b>
+<a href='https://github.com/3Kmfi6HP/EDtunnel' target='_blank'>EDtunnel - https://github.com/3Kmfi6HP/EDtunnel</a>
+<iframe src='https://ghbtns.com/github-btn.html?user=USERNAME&repo=REPOSITORY&type=star&count=true&size=large' frameborder='0' scrolling='0' width='170' height='30' title='GitHub'></iframe>
+<a href='//${hostName}/sub/${userIDArray[0]}' target='_blank'>VLESS 节点订阅连接</a>
+<a href='clash://install-config?url=${encodeURIComponent(`https://${hostName}/sub/${userIDArray[0]}?format=clash`)}}' target='_blank'>Clash for Windows 节点订阅连接</a>
+<a href='${clash_link}' target='_blank'>Clash 节点订阅连接</a>
+<a href='${subbestip}' target='_blank'>优选IP自动节点订阅</a>
+<a href='clash://install-config?url=${encodeURIComponent(subbestip)}' target='_blank'>Clash优选IP自动</a>
+<a href='sing-box://import-remote-profile?url=${encodeURIComponent(subbestip)}' target='_blank'>singbox优选IP自动</a>
+<a href='sn://subscription?url=${encodeURIComponent(subbestip)}' target='_blank'>nekobox优选IP自动</a>
+<a href='v2rayng://install-config?url=${encodeURIComponent(subbestip)}' target='_blank'>v2rayNG优选IP自动</a></p>`;
 
-        vlessWsTls += `vless://${userID}@${addr}:443?encryption=none&security=tls&type=ws&host=${
-            randomUpperCase(hostName)
-        }&sni=${
-            randomUpperCase(hostName)
-        }&fp=randomized&alpn=http/1.1&path=${
-            encodeURIComponent(`/${getRandomPath(16)}?ed=2048`)
-        }#${encodeURIComponent(remark)}\n`;
-    });
+	// HTML Head with CSS and FontAwesome library
+	const htmlHead = `
+  <head>
+	<title>EDtunnel: VLESS configuration</title>
+	<meta name='description' content='This is a tool for generating VLESS protocol configurations. Give us a star on GitHub https://github.com/3Kmfi6HP/EDtunnel if you found it useful!'>
+	<meta name='keywords' content='EDtunnel, cloudflare pages, cloudflare worker, severless'>
+	<meta name='viewport' content='width=device-width, initial-scale=1'>
+	<meta property='og:site_name' content='EDtunnel: VLESS configuration' />
+	<meta property='og:type' content='website' />
+	<meta property='og:title' content='EDtunnel - VLESS configuration and subscribe output' />
+	<meta property='og:description' content='Use cloudflare pages and worker severless to implement vless protocol' />
+	<meta property='og:url' content='https://${hostName}/' />
+	<meta property='og:image' content='https://api.qrserver.com/v1/create-qr-code/?size=500x500&data=${encodeURIComponent(`vless://${userIDs.split(",")[0]}@${hostName}${commonUrlPart}`)}' />
+	<meta name='twitter:card' content='summary_large_image' />
+	<meta name='twitter:title' content='EDtunnel - VLESS configuration and subscribe output' />
+	<meta name='twitter:description' content='Use cloudflare pages and worker severless to implement vless protocol' />
+	<meta name='twitter:url' content='https://${hostName}/' />
+	<meta name='twitter:image' content='https://cloudflare-ipfs.com/ipfs/bafybeigd6i5aavwpr6wvnwuyayklq3omonggta4x2q7kpmgafj357nkcky' />
+	<meta property='og:image:width' content='1500' />
+	<meta property='og:image:height' content='1500' />
 
-    const subscription = client === 'singbox' ? btoa(vlessWsTls) : btoa(vlessWsTls.replaceAll('http/1.1', 'h2,http/1.1'));
-    return subscription;
+	<style>
+	body {
+	  font-family: Arial, sans-serif;
+	  background-color: #f0f0f0;
+	  color: #333;
+	  padding: 10px;
+	}
+
+	a {
+	  color: #1a0dab;
+	  text-decoration: none;
+	}
+	img {
+	  max-width: 100%;
+	  height: auto;
+	}
+
+	pre {
+	  white-space: pre-wrap;
+	  word-wrap: break-word;
+	  background-color: #fff;
+	  border: 1px solid #ddd;
+	  padding: 15px;
+	  margin: 10px 0;
+	}
+	/* Dark mode */
+	@media (prefers-color-scheme: dark) {
+	  body {
+		background-color: #333;
+		color: #f0f0f0;
+	  }
+
+	  a {
+		color: #9db4ff;
+	  }
+
+	  pre {
+		background-color: #282a36;
+		border-color: #6272a4;
+	  }
+	}
+	</style>
+
+	<!-- Add FontAwesome library -->
+	<link rel='stylesheet' href='https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css'>
+  </head>
+  `;
+
+	// Join output with newlines, wrap inside <html> and <body>
+	return `
+  <html>
+  ${htmlHead}
+  <body>
+  <pre style='background-color: transparent; border: none;'>${header}</pre>
+  <pre>${output}</pre>
+  </body>
+  <script>
+	function copyToClipboard(text) {
+	  navigator.clipboard.writeText(text)
+		.then(() => {
+		  alert("Copied to clipboard");
+		})
+		.catch((err) => {
+		  console.error("Failed to copy to clipboard:", err);
+		});
+	}
+  </script>
+  </html>`;
 }
 
-const extractVlessParams = async (vlessConfig) => {
-    const url = new URL(vlessConfig.replace('vless', 'http'));
-    const params = new URLSearchParams(url.search);
-    let configParams = {
-        uuid : url.username,
-        hostName : url.hostname,
-        port : url.port
-    };
+const portSet_http = new Set([80, 8080, 8880, 2052, 2086, 2095, 2082]);
+const portSet_https = new Set([443, 8443, 2053, 2096, 2087, 2083]);
 
-    params.forEach( (value, key) => {
-        configParams[key] = value;
-    })
+function createVLESSSub(userID_Path, hostName) {
+	const userIDArray = userID_Path.includes(',') ? userID_Path.split(',') : [userID_Path];
+	const commonUrlPart_http = `?encryption=none&security=none&fp=random&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#`;
+	const commonUrlPart_https = `?encryption=none&security=tls&sni=${hostName}&fp=random&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#`;
 
-    return JSON.stringify(configParams);
-}
-
-const buildProxyOutbound = async (proxyParams) => {
-    const { hostName, port, uuid, flow, security, type, sni, fp, alpn, pbk, sid, spx, headerType, host, path, authority, serviceName, mode } = proxyParams;
-    let proxyOutbound = structuredClone(xrayOutboundTemp);   
-    proxyOutbound.settings.vnext[0].address = hostName;
-    proxyOutbound.settings.vnext[0].port = +port;
-    proxyOutbound.settings.vnext[0].users[0].id = uuid;
-    proxyOutbound.settings.vnext[0].users[0].flow = flow;
-    proxyOutbound.streamSettings.security = security;
-    proxyOutbound.streamSettings.network = type;
-    proxyOutbound.tag = "out";
-    proxyOutbound.streamSettings.sockopt.dialerProxy = "proxy";
-
-    switch (security) {
-
-        case 'tls':
-            proxyOutbound.streamSettings.tlsSettings.serverName = sni;
-            proxyOutbound.streamSettings.tlsSettings.fingerprint = fp;
-            proxyOutbound.streamSettings.tlsSettings.alpn = alpn ? alpn?.split(',') : [];
-            delete proxyOutbound.streamSettings.realitySettings;         
-            break;
-
-        case 'reality':
-            proxyOutbound.streamSettings.realitySettings.publicKey = pbk;
-            proxyOutbound.streamSettings.realitySettings.shortId = sid;
-            proxyOutbound.streamSettings.realitySettings.serverName = sni;
-            proxyOutbound.streamSettings.realitySettings.fingerprint = fp;
-            proxyOutbound.streamSettings.realitySettings.spiderX = spx;
-            delete proxyOutbound.mux;
-            delete proxyOutbound.streamSettings.tlsSettings;
-            break;
-
-        default:
-            delete proxyOutbound.streamSettings.tlsSettings;
-            delete proxyOutbound.streamSettings.realitySettings;         
-            break;
-    }
- 
-    switch (type) {
-
-        case 'tcp':
-            delete proxyOutbound.streamSettings.grpcSettings;
-            delete proxyOutbound.streamSettings.wsSettings;
-            
-            if (security === 'reality' && !headerType) {
-                delete proxyOutbound.streamSettings.tcpSettings;
-                break;
-            }
-
-            if (headerType === 'http') {
-                proxyOutbound.streamSettings.tcpSettings.header.request.headers.Host = host?.split(',');
-                proxyOutbound.streamSettings.tcpSettings.header.request.path = path?.split(',');
-            } 
-            
-            if (!headerType) {
-                proxyOutbound.streamSettings.tcpSettings.header.type = 'none';
-                delete proxyOutbound.streamSettings.tcpSettings.header.request;
-                delete proxyOutbound.streamSettings.tcpSettings.header.response;
-            }
-            
-            break;
-
-        case 'ws':
-            
-            proxyOutbound.streamSettings.wsSettings.headers.Host = host;
-            proxyOutbound.streamSettings.wsSettings.path = path;
-            delete proxyOutbound.streamSettings.grpcSettings;
-            delete proxyOutbound.streamSettings.tcpSettings;
-            break;
-
-        case 'grpc':
-            
-            proxyOutbound.streamSettings.grpcSettings.authority = authority;
-            proxyOutbound.streamSettings.grpcSettings.serviceName = serviceName;
-            proxyOutbound.streamSettings.grpcSettings.multiMode = mode === 'multi';
-            delete proxyOutbound.mux;
-            delete proxyOutbound.streamSettings.tcpSettings;
-            delete proxyOutbound.streamSettings.wsSettings;
-            break;
-
-        default:
-            break;
-    }
-    
-    return proxyOutbound;
-}
-
-const getFragmentConfigs = async (env, hostName, client) => {
-    let Configs = [];
-    let outbounds = [];
-    let proxySettings = await env.bpb.get("proxySettings", {type: 'json'});
-    const {
-        remoteDNS, 
-        localDNS, 
-        lengthMin, 
-        lengthMax, 
-        intervalMin, 
-        intervalMax,
-        blockAds,
-        bypassIran, 
-        cleanIPs,
-        outProxy,
-        outProxyParams
-    } = proxySettings;
-
-    let proxyOutbound;
-    const resolved = await resolveDNS(hostName);
-    const Addresses = [
-        hostName,
-        "www.speedtest.net",
-        ...(cleanIPs ? cleanIPs.split(",") : []),
-        ...resolved.ipv4,
-        ...resolved.ipv6.map((ip) => `[${ip}]`),
-    ];
-
-    if (outProxy) {
-        const proxyParams = JSON.parse(outProxyParams);
-        try {
-            proxyOutbound = await buildProxyOutbound(proxyParams);
-        } catch (error) {
-            console.log(error);
-            proxyOutbound = undefined;
-            await env.bpb.put("proxySettings", JSON.stringify({
-                ...proxySettings, 
-                outProxy: '',
-                outProxyParams: ''}));
-        }
-    }
-
-    Addresses.forEach((addr, index) => {
-
-        let fragConfig = structuredClone(xrayConfigTemp);
-        let outbound = structuredClone(xrayOutboundTemp);
-        let remark = `💦 BPB - ${addr}`;
-        delete outbound.mux;
-        delete outbound.streamSettings.grpcSettings;
-        delete outbound.streamSettings.realitySettings;
-        delete outbound.streamSettings.tcpSettings;
-        outbound.settings.vnext[0].address = addr;
-        outbound.settings.vnext[0].port = 443;
-        outbound.settings.vnext[0].users[0].id = userID;
-        outbound.streamSettings.tlsSettings.serverName = randomUpperCase(hostName);
-        outbound.streamSettings.wsSettings.headers.Host = randomUpperCase(hostName);
-        outbound.streamSettings.wsSettings.path = `/${getRandomPath(16)}?ed=2048`;
-        
-        fragConfig.remarks = remark.length <= 30 ? remark : `${remark.slice(0,29)}...`;;
-        fragConfig.dns.servers[0] = remoteDNS;
-        fragConfig.dns.servers[1].address = localDNS;
-        fragConfig.outbounds[2].settings.fragment.length = `${lengthMin}-${lengthMax}`;
-        fragConfig.outbounds[2].settings.fragment.interval = `${intervalMin}-${intervalMax}`;
-        fragConfig.routing.rules[0].ip = [localDNS];
-
-        if (proxyOutbound) {
-            fragConfig.outbounds = [{...proxyOutbound}, { ...outbound}, ...fragConfig.outbounds];
-        } else {
-            fragConfig.outbounds = [{ ...outbound}, ...fragConfig.outbounds];
-        }
-
-        delete fragConfig.observatory;
-        delete fragConfig.routing.balancers;
-        fragConfig.routing.rules.pop();
-
-        if (!bypassIran) {
-            fragConfig.dns.servers[1].domains = ["geosite:private"];
-            fragConfig.routing.rules[1].domain = ["geosite:private"];
-            fragConfig.routing.rules[2].ip = ["geoip:private"];
-        }
-
-        if (!blockAds) {
-            fragConfig.dns.hosts = {"domain:googleapis.cn": "googleapis.com"};
-            fragConfig.routing.rules.pop();
-        }
-
-        if (client === 'nekoray') {
-            fragConfig.inbounds[0].port = 2080;
-            fragConfig.inbounds[1].port = 2081;
-        }
-                    
-        Configs.push({
-            address: addr,
-            config: fragConfig
-        }); 
-
-        outbound.tag = `proxy_${index + 1}`;
-    
-        if (proxyOutbound) {
-            let proxyOut = structuredClone(proxyOutbound);
-            proxyOut.tag = `out_${index + 1}`;
-            proxyOut.streamSettings.sockopt.dialerProxy = `proxy_${index + 1}`;
-            outbounds.push({...proxyOut}, {...outbound});
-        } else {
-            outbounds.push({...outbound});
-        }
-    });
-
-
-    let bestPing = structuredClone(xrayConfigTemp);
-    bestPing.remarks = '💦 BPB Frag - Best Ping 💥';
-    bestPing.dns.servers[0] = remoteDNS;
-    bestPing.dns.servers[1].address = localDNS;
-    bestPing.outbounds[2].settings.fragment.length = `${lengthMin}-${lengthMax}`;
-    bestPing.outbounds[2].settings.fragment.interval = `${intervalMin}-${intervalMax}`;
-    bestPing.routing.rules[0].ip = [localDNS];
-    bestPing.outbounds = [...outbounds, ...bestPing.outbounds];
-    
-    if (!bypassIran) {
-        bestPing.dns.servers[1].domains = ["geosite:private"];
-        bestPing.routing.rules[1].domain = ["geosite:private"];
-        bestPing.routing.rules[2].ip = ["geoip:private"];
-    }
-    
-    if (!blockAds) {
-        bestPing.dns.hosts = {"domain:googleapis.cn": "googleapis.com"};
-        bestPing.routing.rules.splice(3,1);
-    }
-    
-    if (proxyOutbound) {
-        bestPing.observatory.subjectSelector = ["out"];
-        bestPing.routing.balancers[0].selector = ["out"];
-    }
-
-    if (client === 'nekoray') {
-        bestPing.inbounds[0].port = 2080;
-        bestPing.inbounds[1].port = 2081;
-    }
-
-    Configs.push({
-        address: "Best-Ping",
-        config: bestPing,
-    });
-
-    return Configs;
-}
-
-const getSingboxConfig = async (env, hostName) => {
-    const {
-        remoteDNS, 
-        localDNS,
-        cleanIPs
-    } = await env.bpb.get("proxySettings", {type: 'json'});
-
-    let config = structuredClone(singboxConfigTemp);
-    config.dns.servers[0].address = remoteDNS;
-    config.dns.servers[1].address = localDNS;
-
-    const resolved = await resolveDNS(hostName);
-    const Addresses = [
-        hostName,
-        "www.speedtest.net",
-        ...(cleanIPs ? cleanIPs.split(",") : []),
-        ...resolved.ipv4,
-        ...resolved.ipv6.map((ip) => `[${ip}]`),
-    ];
-
-    Addresses.forEach(addr => {
-        let outbound = structuredClone(singboxOutboundTemp);
-        outbound.server = addr;
-        outbound.tag = addr;
-        outbound.tls.server_name = randomUpperCase(hostName);
-        outbound.transport.headers.Host = randomUpperCase(hostName);
-        outbound.transport.path += getRandomPath(16);
-        config.outbounds.push(outbound);
-        config.outbounds[0].outbounds.push(addr);
-        config.outbounds[1].outbounds.push(addr);
-    });
-
-    return config;
-}
-
-const updateDataset = async (env, Settings) => {
-
-    const vlessConfig = Settings?.get('outProxy');
-    const proxySettings = {
-        remoteDNS: Settings?.get('remoteDNS') || 'https://94.140.14.14/dns-query',
-        localDNS: Settings?.get('localDNS') || '8.8.8.8',
-        lengthMin: Settings?.get('fragmentLengthMin') || '100',
-        lengthMax: Settings?.get('fragmentLengthMax') || '200',
-        intervalMin: Settings?.get('fragmentIntervalMin') || '5',
-        intervalMax: Settings?.get('fragmentIntervalMax') || '10',
-        blockAds: Settings?.get('block-ads') || false,
-        bypassIran: Settings?.get('bypass-iran') || false,
-        cleanIPs: Settings?.get('cleanIPs')?.replaceAll(' ', '') || '',
-        outProxy: vlessConfig || '',
-        outProxyParams: vlessConfig ? await extractVlessParams(vlessConfig) : ''
-    };
-
-    try {    
-        await env.bpb.put("proxySettings", JSON.stringify(proxySettings));          
-    } catch (error) {
-        throw new error(error);
-    }
-}
-
-const randomUpperCase = (str) => {
-    let result = '';
-    for (let i = 0; i < str.length; i++) {
-        result += Math.random() < 0.5 ? str[i].toUpperCase() : str[i];
-    }
-    return result;
-}
-
-const getRandomPath = (length) => {
-    let result = '';
-    const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-    const charactersLength = characters.length;
-    for (let i = 0; i < length; i++) {
-        result += characters.charAt(Math.floor(Math.random() * charactersLength));
-    }
-    return result;
-}
-
-const resolveDNS = async (domain) => {
-    const dohURLv4 = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=A`;
-    const dohURLv6 = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=AAAA`;
-
-    try {
-        const [ipv4Response, ipv6Response] = await Promise.all([
-            fetch(dohURLv4, { headers: { accept: 'application/dns-json' } }),
-            fetch(dohURLv6, { headers: { accept: 'application/dns-json' } }),
-        ]);
-
-        const ipv4Addresses = await ipv4Response.json();
-        const ipv6Addresses = await ipv6Response.json();
-
-        const ipv4 = ipv4Addresses.Answer
-            ? ipv4Addresses.Answer.map((record) => record.data)
-            : [];
-        const ipv6 = ipv6Addresses.Answer
-            ? ipv6Addresses.Answer.map((record) => record.data)
-            : [];
-
-        return { ipv4, ipv6 };
-    } catch (error) {
-        console.error('Error resolving DNS:', error);
-    }
-}
-
-const generateJWTToken = (password, secretKey) => {
-    const header = {
-        alg: 'HS256',
-        typ: 'JWT'
-    };
-
-    const payload = {
-        exp: Math.floor(Date.now() / 1000) + (24 * 60 * 60),
-        data: { password }
-    };
-    const encodedHeader = btoa(JSON.stringify(header));
-    const encodedPayload = btoa(JSON.stringify(payload));
-    const signature = btoa(crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${encodedHeader}.${encodedPayload}.${secretKey}`)));
-
-    return `Bearer ${encodedHeader}.${encodedPayload}.${signature}`;
-}
-
-const generateSecretKey = () => {
-    const bytes = new Uint8Array(32);
-    crypto.getRandomValues(bytes);
-    return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
-}
-  
-const Authenticate = async (request, env) => {
-    const secretKey = await env.bpb.get('secretKey');
-
-    try {
-        const cookie = request.headers.get('Cookie');
-        const cookieMatch = cookie ? cookie.match(/(^|;\s*)jwtToken=([^;]*)/) : null;
-        const token = cookieMatch ? cookieMatch.pop() : null;
-
-        if (!token) return false;
-
-        const tokenWithoutBearer = token.startsWith('Bearer ') ? token.slice(7) : token;
-        const [encodedHeader, encodedPayload, signature] = tokenWithoutBearer.split('.');
-        const payload = JSON.parse(atob(encodedPayload));
-
-        const expectedSignature = btoa(crypto.subtle.digest(
-            'SHA-256',
-            new TextEncoder().encode(`${encodedHeader}.${encodedPayload}.${secretKey}`)
-        ));
-
-        if (signature !== expectedSignature) return false;
-
-        const now = Math.floor(Date.now() / 1000);
-        if (payload.exp < now) return false;
-
-        return true;
-    } catch (error) {
-        return false;
-    }
-}
-
-const renderHomePage = async (env, hostName, fragConfigs) => {
-    const {
-        remoteDNS, 
-        localDNS, 
-        lengthMin, 
-        lengthMax, 
-        intervalMin, 
-        intervalMax, 
-        blockAds,
-        bypassIran,
-        cleanIPs,
-        outProxy
-    } = await env.bpb.get("proxySettings", {type: 'json'});
-
-    const genCustomConfRow = async (configs) => {
-        let tableBlock = "";
-        configs.forEach(config => {
-            tableBlock += `
-            <tr>
-                <td>
-                    ${config.address === 'Best-Ping' 
-                        ? `<div  style="display: flex; align-items: center; justify-content: center;"><span class="material-symbols-outlined">speed</span><span>&nbsp;<b>${config.address}</b></span></div>` 
-                        : config.address
-                    }
-                </td>
-                <td>
-                    <button onclick="copyToClipboard('${encodeURIComponent(JSON.stringify(config.config, null, 4))}', true)">
-                        Copy Config 
-                        <span class="material-symbols-outlined">copy_all</span>
-                    </button>
-                </td>
-            </tr>`;
-        });
-
-        return tableBlock;
-    }
-
-    const html = `
-    <!DOCTYPE html>
-    <html lang="en">
-
-	<head>
-		<meta charset="UTF-8">
-		<meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css">
-        <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" />
-		<style>
-			body { font-family: system-ui; }
-            .material-symbols-outlined {
-                margin-left: 5px;
-                font-variation-settings:
-                'FILL' 0,
-                'wght' 400,
-                'GRAD' 0,
-                'opsz' 24
-            }
-			h2 { margin: 30px 0; text-align: center; color: #3b3b3b; }
-			hr { border: 1px solid #ddd; margin: 20px 0; }
-            .footer {
-                display: flex;
-                font-weight: 600;
-                margin: 10px auto 0 auto;
-                justify-content: center;
-                align-items: center;
-            }
-            .footer button {margin: 0 20px; background: #212121; max-width: fit-content;}
-            .footer button:hover, .footer button:focus { background: #3b3b3b;}
-            .form-control a, a.link { text-decoration: none; }
-			.form-control {
-				margin-bottom: 15px;
-				display: grid;
-				grid-template-columns: 1fr 1fr;
-				align-items: baseline;
-				justify-content: flex-end;
-				font-family: Arial, sans-serif;
+	const output = userIDArray.flatMap((userID) => {
+		const httpConfigurations = Array.from(portSet_http).flatMap((port) => {
+			if (!hostName.includes('pages.dev')) {
+				const urlPart = `${hostName}-HTTP-${port}`;
+				const vlessMainHttp = `vless://${userID}@${hostName}:${port}${commonUrlPart_http}${urlPart}`;
+				return proxyIPs.flatMap((proxyIP) => {
+					const vlessSecHttp = `vless://${userID}@${proxyIP}:${port}${commonUrlPart_http}${urlPart}-${proxyIP}-EDtunnel`;
+					return [vlessMainHttp, vlessSecHttp];
+				});
 			}
-            .form-control button {
-                background-color: white;
-                font-size: 1.1rem;
-                font-weight: 600;
-                color: #09639f;
-                border-color: #09639f;
-                border: 2px solid;
-            }
-            #apply {display: block; margin-top: 30px;}
-            input.button {font-weight: 600; padding: 15px 0; font-size: 1.1rem;}
-			label {
-				display: block;
-				margin-bottom: 5px;
-				font-size: 110%;
-				font-weight: 600;
-				color: #333;
-			}
-			input[type="text"],
-			input[type="number"],
-			input[type="url"],
-			textarea,
-			select {
-				width: 100%;
-				text-align: center;
-				padding: 10px;
-				border: 1px solid #ddd;
-				border-radius: 5px;
-				font-size: 16px;
-				color: #333;
-				background-color: #fff;
-				box-sizing: border-box;
-				margin-bottom: 15px;
-				transition: border-color 0.3s ease;
-			}	
-			input[type="text"]:focus,
-			input[type="number"]:focus,
-			input[type="url"]:focus,
-			textarea:focus,
-			select:focus { border-color: #3498db; outline: none; }
-			.button,
-			table button {
-				display: flex;
-                align-items: center;
-                justify-content: center;
-                width: 100%;
-				white-space: nowrap;
-				padding: 10px 20px;
-				font-size: 16px;
-                font-weight: 600;
-				letter-spacing: 1px;
-				border: none;
-				border-radius: 5px;
-				color: #fff;
-				background-color: #09639f;
-				cursor: pointer;
-				outline: none;
-				box-shadow: 0 5px 10px rgba(0, 0, 0, 0.2);
-				transition: all 0.3s ease;
-			}
-            table button { margin: auto; width: auto; }
-            .button.disabled {
-                background-color: #ccc;
-                cursor: not-allowed;
-                box-shadow: none;
-                pointer-events: none;
-            }
-			.button:hover,
-			.button:focus,
-			table button:hover,
-			table button:focus {
-				background-color: #2980b9;
-				box-shadow: 0 8px 15px rgba(0, 0, 0, 0.3);
-				transform: translateY(-2px);
-			}
-            button.button:hover { color: white; }
-			.button:active,
-			table button:active {
-				transform: translateY(1px);
-				box-shadow: 0 3px 7px rgba(0, 0, 0, 0.3);
-			}
-			.form-container {
-				max-width: 90%;
-				margin: 0 auto;
-				padding: 20px;
-				background: #f9f9f9;
-				border: 1px solid #eaeaea;
-				border-radius: 10px;
-				box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-			}
-			.table-container { margin-top: 20px; overflow-x: auto; }
-			table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
-			th, td { padding: 8px 15px; border-bottom: 1px solid #ddd; }
-			th { background-color: #3498db; color: white; font-weight: bold; font-size: 1.1rem; width: 50%;}
-			tr:nth-child(odd) { background-color: #f2f2f2; }
-            #custom-configs-table td { text-align: center; }
-			tr:hover { background-color: #f1f1f1; }
-            .modal {
-                display: none;
-                position: fixed;
-                z-index: 1;
-                left: 0;
-                top: 0;
-                width: 100%;
-                height: 100%;
-                overflow: auto;
-                background-color: rgba(0, 0, 0, 0.4);
-            }
-            .modal-content {
-                background-color: #f9f9f9;
-                margin: auto;
-                padding: 20px;
-                border: 1px solid #eaeaea;
-                border-radius: 10px;
-                box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-                width: 80%;
-                position: absolute;
-                top: 50%;
-                left: 50%;
-                transform: translate(-50%, -50%);
-            }
-            .close {
-                color: #aaa;
-                float: right;
-                font-size: 28px;
-                font-weight: bold;
-            }
-            .close:hover,
-            .close:focus {
-                color: black;
-                text-decoration: none;
-                cursor: pointer;
-            }
-            .form-control label {
-                display: block;
-                margin-bottom: 5px;
-                font-size: 110%;
-                font-weight: 600;
-                color: #333;
-            }
-            .form-control input[type="password"] {
-                width: 100%;
-                padding: 10px;
-                border: 1px solid #ddd;
-                border-radius: 5px;
-                font-size: 16px;
-                color: #333;
-                background-color: #fff;
-                box-sizing: border-box;
-                margin-bottom: 15px;
-                transition: border-color 0.3s ease;
-            }
-            .routing { display: flex; justify-content: center; align-items: center; margin-bottom: 15px; }
-            .routing label { margin: 0; font-weight: 400; font-size: 100%; }
-            .form-control input[type="password"]:focus {
-                border-color: #3498db;
-                outline: none;
-            }
-            #passwordError {
-                color: red;
-                margin-bottom: 10px;
-            }
-            @media only screen and (min-width: 768px) {
-                .form-container { max-width: 70%; }
-                #apply { display: block; margin: 30px auto 0 auto; max-width: 50%; }
-                .modal-content { width: 30% }
-            }
-		</style>
-	</head>
-	
-	<body>
-		<h1 style="text-align: center; color: #2980b9">BPB Panel <span style="font-size: smaller;">2.3</span> 💦</h1>
-		<div class="form-container">
-            <h2>FRAGMENT SETTINGS ⚙️</h2>
-			<form id="configForm">
-				<div class="form-control">
-					<label for="remoteDNS">🌏 Remote DNS</label>
-					<input type="url" id="remoteDNS" name="remoteDNS" value="${remoteDNS}" required>
-				</div>
-				<div class="form-control">
-					<label for="localDNS">🏚️ Local DNS</label>
-					<input type="text" id="localDNS" name="localDNS" value="${localDNS}"
-						pattern="^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$"
-						title="Please enter a valid DNS IP Address!"  required>
-				</div>	
-				<div class="form-control">
-					<label for="fragmentLengthMin">📐 Length</label>
-					<div style="display: grid; grid-template-columns: 1fr auto 1fr; align-items: baseline;">
-						<input type="number" id="fragmentLengthMin" name="fragmentLengthMin" value="${lengthMin}" min="10" required>
-						<span style="text-align: center; white-space: pre;"> - </span>
-						<input type="number" id="fragmentLengthMax" name="fragmentLengthMax" value="${lengthMax}" max="500" required>
-					</div>
-				</div>
-				<div class="form-control">
-					<label for="fragmentIntervalMin">🕞 Interval</label>
-					<div style="display: grid; grid-template-columns: 1fr auto 1fr; align-items: baseline;">
-						<input type="number" id="fragmentIntervalMin" name="fragmentIntervalMin"
-						value="${intervalMin}" max="30" required>
-						<span style="text-align: center; white-space: pre;"> - </span>
-						<input type="number" id="fragmentIntervalMax" name="fragmentIntervalMax"
-						value="${intervalMax}" max="30" required>
-					</div>
-				</div>
-				<div class="form-control">
-					<label for="outProxy">✈️ Chain Proxy</label>
-					<input type="text" id="outProxy" name="outProxy" value="${outProxy}">
-				</div>
-                <h2>ROUTING RULES ⚙️</h2>
-				<div class="form-control" style="margin-bottom: 20px;">			
-                    <div class="routing">
-                        <input type="checkbox" id="block-ads" name="block-ads" style="margin: 0 10px 0 0;" value="true" ${blockAds ? 'checked' : ''}>
-                        <label for="block-ads">Block Ads</label>
-                    </div>
-                    <div class="routing">
-						<input type="checkbox" id="bypass-iran" name="bypass-iran" style="margin: 0 10px 0 0;;" value="true" ${bypassIran ? 'checked' : ''}>
-                        <label for="bypass-iran">Direct Iran</label>
-					</div>
-				</div>
-                <h2>CLEAN IP ⚙️</h2>
-				<div class="form-control">
-					<label for="cleanIPs">✨ Clean IPs</label>
-					<input type="text" id="cleanIPs" name="cleanIPs" value="${cleanIPs.replaceAll(",", " , ")}">
-				</div>
-                <div class="form-control">
-                    <label>🔎 Online Scanner</label>
-                    <a href="https://scanner.github1.cloud/" id="scanner" name="scanner" target="_blank">
-                        <button type="button" class="button">
-                            Scan now
-                            <span class="material-symbols-outlined" style="margin-left: 5px;">open_in_new</span>
-                        </button>
-                    </a>
-                </div>
-				<div id="apply" class="form-control">
-					<div style="grid-column: 2; width: 100%;">
-						<input type="submit" id="applyButton" class="button disabled" value="APPLY SETTINGS 💥" form="configForm">
-					</div>
-				</div>
-			</form>
-            <hr>
-            
-			<h2>NORMAL CONFIGS 🔗</h2>
-			<div class="table-container">
-				<table id="normal-configs-table">
-					<tr>
-						<th>Application</th>
-						<th>Subscription</th>
-					</tr>
-					<tr>
-                        <td>
-                            <div style="display: flex; align-items: center;">
-                                <span class="material-symbols-outlined" style="margin-right: 8px;">verified</span>
-                                <span>v2rayNG</span>
-                            </div>
-                            <div style="display: flex; align-items: center;">
-                                <span class="material-symbols-outlined" style="margin-right: 8px;">verified</span>
-                                <span>v2rayN</span>
-                            </div>
-                            <div style="display: flex; align-items: center;">
-                                <span class="material-symbols-outlined" style="margin-right: 8px;">verified</span>
-                                <span>Shadowrocket</span>
-                            </div>
-                            <div style="display: flex; align-items: center;">
-                                <span class="material-symbols-outlined" style="margin-right: 8px;">verified</span>
-                                <span>Streisand</span>
-                            </div>
-                            <div style="display: flex; align-items: center;">
-                                <span class="material-symbols-outlined" style="margin-right: 8px;">verified</span>
-                                <span>Nekoray (Xray)</span>
-                            </div>
-                        </td>
-						<td>
-                            <button onclick="copyToClipboard('https://${hostName}/sub/${userID}#BPB%20Normal', false)">
-                                Copy Sub
-                                <span class="material-symbols-outlined">format_list_bulleted</span>
-                            </button>
-                        </td>
-					</tr>
-					<tr>
-                        <td>
-                            <div style="display: flex; align-items: center;">
-                                <span class="material-symbols-outlined" style="margin-right: 8px;">verified</span>
-                                <span>Nekobox</span>
-                            </div>
-                            <div style="display: flex; align-items: center;">
-                                <span class="material-symbols-outlined" style="margin-right: 8px;">verified</span>
-                                <span>Hiddify Next</span>
-                            </div>
-                            <div style="display: flex; align-items: center;">
-                                <span class="material-symbols-outlined" style="margin-right: 8px;">verified</span>
-                                <span>Nekoray (Sing-Box)</span>
-                            </div>
-                        </td>
-						<td>
-                            <button onclick="copyToClipboard('https://${hostName}/sub/${userID}?app=singbox#BPB-Normal', false)">
-                                Copy Sub
-                                <span class="material-symbols-outlined">format_list_bulleted</span>
-                            </button>
-						</td>
-					</tr>
-                    <tr>
-                        <td>
-                            <div style="display: flex; align-items: center;">
-                                <span class="material-symbols-outlined" style="margin-right: 8px;">verified</span>
-                                <span>Sing-box - <b>Best Ping</b></span>
-                            </div>
-                        </td>
-                        <td>
-                            <button onclick="copyToClipboard('https://${hostName}/sub/${userID}?app=sfa#BPB-Normal', false)">
-                                Copy Sub
-                                <span class="material-symbols-outlined">format_list_bulleted</span>
-                            </button>
-                        </td>
-                    </tr>
-				</table>
-			</div>
-			<hr>
-			<h2>FRAGMENT SUB ⛓️</h2>
-			<div class="table-container">
-                <table id="frag-sub-table">
-                    <tr>
-                        <th style="text-wrap: nowrap;">Application</th>
-                        <th style="text-wrap: nowrap;">Fragment Subscription</th>
-                    </tr>
-                    <tr>
-                        <td style="text-wrap: nowrap;">
-                            <div style="display: flex; align-items: center;">
-                                <span class="material-symbols-outlined" style="margin-right: 8px;">verified</span>
-                                <span>v2rayNG</span>
-                            </div>
-                            <div style="display: flex; align-items: center;">
-                                <span class="material-symbols-outlined" style="margin-right: 8px;">verified</span>
-                                <span>v2rayN</span>
-                            </div>
-                            <div style="display: flex; align-items: center;">
-                                <span class="material-symbols-outlined" style="margin-right: 8px;">verified</span>
-                                <span>Streisand</span>
-                            </div>
-                        </td>
-                        <td>
-                            <button onclick="copyToClipboard('https://${hostName}/fragsub/${userID}#BPB Fragment', true)">
-                                Copy Sub
-                                <span class="material-symbols-outlined">format_list_bulleted</span>
-                            </button>
-                        </td>
-                    </tr>
-                </table>
-            </div>
-            <h2>FRAGMENT CONFIG ⛓️</h2>
-            <div class="table-container">
-				<table id="custom-configs-table">
-					<tr style="text-wrap: nowrap;">
-						<th>Config Address</th>
-						<th>Nekoray Config</th>
-					</tr>					
-					${await genCustomConfRow(fragConfigs)}
-				</table>
-			</div>
-            <div id="myModal" class="modal">
-                <div class="modal-content">
-                <span class="close">&times;</span>
-                <form id="passwordChangeForm">
-                    <h2>Change Password</h2>
-                    <div class="form-control">
-                        <label for="newPassword">New Password</label>
-                        <input type="password" id="newPassword" name="newPassword" required>
-                        </div>
-                    <div class="form-control">
-                        <label for="confirmPassword">Confirm Password</label>
-                        <input type="password" id="confirmPassword" name="confirmPassword" required>
-                    </div>
-                    <div id="passwordError" style="color: red; margin-bottom: 10px;"></div>
-                    <button id="changePasswordBtn" type="submit" class="button">Change Password</button>
-                </form>
-                </div>
-            </div>
-            <div class="footer">
-                <i class="fa fa-github" style="font-size:36px; margin-right: 10px;"></i>
-                <a class="link" href="https://github.com/bia-pain-bache/BPB-Worker-Panel" target="_blank">Github</a>
-                <button id="openModalBtn" class="button">Change Password</button>
-                <button type="button" id="logout" style="background: none; margin: 0; border: none; cursor: pointer;">
-                    <i class="fa fa-power-off fa-2x" aria-hidden="true"></i>
-                </button>
-            </div>
-        </div>
-
-	<script>
-		document.addEventListener('DOMContentLoaded', () => {
-            const configForm = document.getElementById('configForm');            
-            const modal = document.getElementById('myModal');
-            const changePass = document.getElementById("openModalBtn");
-            const closeBtn = document.querySelector(".close");
-            const passwordChangeForm = document.getElementById('passwordChangeForm');            
-            const applyBtn = document.getElementById('applyButton');         
-            const initialFormData = new FormData(configForm);
-          
-            const hasFormDataChanged = () => {
-                const currentFormData = new FormData(configForm);
-                const currentFormDataEntries = [...currentFormData.entries()];
-
-                const nonCheckboxFieldsChanged = currentFormDataEntries.some(
-                    ([key, value]) => !initialFormData.has(key) || initialFormData.get(key) !== value
-                );
-
-                const checkboxFieldsChanged = Array.from(configForm.elements)
-                    .filter((element) => element.type === 'checkbox')
-                    .some((checkbox) => {
-                    const initialValue = initialFormData.has(checkbox.name)
-                        ? initialFormData.get(checkbox.name)
-                        : false;
-                    const currentValue = currentFormDataEntries.find(([key]) => key === checkbox.name)?.[1] || false;
-                    return initialValue !== currentValue;
-                });
-
-                return nonCheckboxFieldsChanged || checkboxFieldsChanged;
-            };
-          
-            const enableApplyButton = () => {
-                const isChanged = hasFormDataChanged();
-                applyButton.disabled = !isChanged;
-                applyButton.classList.toggle('disabled', !isChanged);
-            };
-                      
-            passwordChangeForm.addEventListener('submit', event => resetPassword(event));
-            document.getElementById('logout').addEventListener('click', event => logout(event));
-			configForm.addEventListener('submit', (event) => applySettings(event, configForm));
-            configForm.addEventListener('input', enableApplyButton);
-            configForm.addEventListener('change', enableApplyButton);
-            changePass.addEventListener('click', () => {
-                modal.style.display = "block";
-                document.body.style.overflow = "hidden";
-            });        
-            closeBtn.addEventListener('click', () => {
-                modal.style.display = "none";
-                document.body.style.overflow = "";
-            });
-
+			return [];
 		});
 
-		const copyToClipboard = (text, decode) => {
-            const textarea = document.createElement('textarea');
-            const value = decode ? decodeURIComponent(text) : text;
-			textarea.value = value;
-			document.body.appendChild(textarea);
-			textarea.select();
-			document.execCommand('copy');
-			document.body.removeChild(textarea);
-			alert('📋 Copied to clipboard:\\n\\n' +  value);
-		}
+		const httpsConfigurations = Array.from(portSet_https).flatMap((port) => {
+			const urlPart = `${hostName}-HTTPS-${port}`;
+			const vlessMainHttps = `vless://${userID}@${hostName}:${port}${commonUrlPart_https}${urlPart}`;
+			return proxyIPs.flatMap((proxyIP) => {
+				const vlessSecHttps = `vless://${userID}@${proxyIP}:${port}${commonUrlPart_https}${urlPart}-${proxyIP}-EDtunnel`;
+				return [vlessMainHttps, vlessSecHttps];
+			});
+		});
 
-        const applySettings = async (event, configForm) => {
-            event.preventDefault();
-            event.stopPropagation();
-            const applyButton = document.getElementById('applyButton');
-            const getValue = (id) => parseInt(document.getElementById(id).value, 10);              
-            const lengthMin = getValue('fragmentLengthMin');
-            const lengthMax = getValue('fragmentLengthMax');
-            const intervalMin = getValue('fragmentIntervalMin');
-            const intervalMax = getValue('fragmentIntervalMax');
-            const cleanIP = document.getElementById('cleanIPs');
-            const cleanIPs = cleanIP.value?.split(',');
-            const chainProxy = document.getElementById('outProxy').value;                    
-            const formData = new FormData(configForm);
-            const isVless = /vless:\\/\\/[^\s@]+@[^\\s:]+:[^\\s]+/.test(chainProxy);
-            const hasSecurity = /security=/.test(chainProxy);
-            const validSecurityType = /security=(tls|none|reality)/.test(chainProxy);
-            const validTransmission = /type=(tcp|grpc|ws)/.test(chainProxy);
+		return [...httpConfigurations, ...httpsConfigurations];
+	});
 
-            const invalidIPs = cleanIPs?.filter(value => {
-                if (value !== "") {
-                    const trimmedValue = value.trim();
-                    return !/^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}|(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(trimmedValue);
-                }
-            });
-    
-            if (invalidIPs.length) {
-                alert('⛔ Invalid IPs or Domains 🫤\\n\\n' + invalidIPs.map(ip => '⚠️ ' + ip).join('\\n'));
-                return false;
-            }
-
-            if (lengthMin >= lengthMax || intervalMin >= intervalMax) {
-                alert('⛔ Minimum should be smaller than Maximum! 🫤');               
-                return false;
-            }
-
-            if (!(isVless && (hasSecurity && validSecurityType || !hasSecurity) && validTransmission) && chainProxy) {
-                alert('⛔ Invalid Config! 🫤 \\n - The chain proxy should be VLESS!\\n - Transmission should be GRPC,WS or TCP\\n - Security should be TLS,Reality or None');               
-                return false;
-            }
-
-            try {
-                document.body.style.cursor = 'wait';
-                const applyButtonVal = applyButton.value;
-                applyButton.value = '⌛ Loading...';
-
-                const response = await fetch('/panel', {
-                    method: 'POST',
-                    body: formData,
-                    credentials: 'include'
-                });
-
-                document.body.style.cursor = 'default';
-                applyButton.value = applyButtonVal;
-
-                if (response.ok) {
-                    alert('Parameters applied successfully 😎');
-                    window.location.reload(true);
-                } else {
-                    const errorMessage = await response.text();
-                    console.error(errorMessage, response.status);
-                    alert('⚠️ Session expired! Please login again.');
-                    window.location.href = '/login';
-                }           
-            } catch (error) {
-                console.error('Error:', error);
-            }
-        }
-
-        const logout = async (event) => {
-            event.preventDefault();
-
-            try {
-                const response = await fetch('/logout', {
-                    method: 'GET',
-                    credentials: 'same-origin'
-                });
-            
-                if (response.ok) {
-                    window.location.href = '/login';
-                } else {
-                    console.error('Failed to log out:', response.status);
-                }
-            } catch (error) {
-                console.error('Error:', error);
-            }
-        }
-
-        const resetPassword = async (event) => {
-            event.preventDefault();
-            const modal = document.getElementById('myModal');
-            const newPasswordInput = document.getElementById('newPassword');
-            const confirmPasswordInput = document.getElementById('confirmPassword');
-            const passwordError = document.getElementById('passwordError');             
-            const newPassword = newPasswordInput.value;
-            const confirmPassword = confirmPasswordInput.value;
-    
-            if (newPassword !== confirmPassword) {
-                passwordError.textContent = "Passwords do not match";
-                return false;
-            }
-
-            const hasCapitalLetter = /[A-Z]/.test(newPassword);
-            const hasNumber = /[0-9]/.test(newPassword);
-            const isLongEnough = newPassword.length >= 8;
-
-            if (!(hasCapitalLetter && hasNumber && isLongEnough)) {
-                passwordError.textContent = '⚠️ Password must contain at least one capital letter, one number, and be at least 8 characters long.';
-                return false;
-            }
-                    
-            try {
-                const response = await fetch('/panel/password', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'text/plain'
-                    },
-                    body: newPassword,
-                    credentials: 'same-origin'
-                });
-            
-                if (response.ok) {
-                    modal.style.display = "none";
-                    document.body.style.overflow = "";
-                    alert("Password changed successfully! 👍");
-                    window.location.href = '/login';
-                } else if (response.status === 401) {
-                    const errorMessage = await response.text();
-                    passwordError.textContent = '⚠️ ' + errorMessage;
-                    console.error(errorMessage, response.status);
-                    alert('⚠️ Session expired! Please login again.');
-                    window.location.href = '/login';
-                } else {
-                    const errorMessage = await response.text();
-                    passwordError.textContent = '⚠️ ' + errorMessage;
-                    console.error(errorMessage, response.status);
-                    return false;
-                }
-            } catch (error) {
-                console.error('Error:', error);
-            }
-        }
-	</script>
-	</body>	
-	</html>`;
-
-    return html;
+	return output.join('\n');
 }
 
-const renderLoginPage = async () => {
-    const html = `
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>User Login</title>
-    <style>
-
-        html, body { height: 100%; margin: 0; }
-        body {
-            font-family: system-ui;
-            background-color: #f9f9f9;
-            position: relative;
-            overflow: hidden;
-        }
-        .container {
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            width: 90%;
-        }        
-        h1 {
-            text-align: center;
-            color: #2980b9;
-            margin-bottom: 30px;
-            margin-top: 0px;
-        }
-        h2 {text-align: center;}
-        .form-container {
-            background: #f9f9f9;
-            border: 1px solid #eaeaea;
-            border-radius: 10px;
-            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-            padding: 20px;
-        }
-        .form-control { margin-bottom: 15px; display: flex; align-items: center; }
-        label {
-            display: block;
-            margin-bottom: 5px;
-            padding-right: 20px;
-            font-size: 110%;
-            font-weight: 600;
-            color: #333;
-        }
-        input[type="text"],
-        input[type="password"] {
-            width: 100%;
-            padding: 10px;
-            border: 1px solid #ddd;
-            border-radius: 5px;
-            color: #333;
-        }
-        button {
-            display: block;
-            width: 100%;
-            padding: 10px;
-            font-size: 16px;
-            font-weight: 600;
-            border: none;
-            border-radius: 5px;
-            color: #fff;
-            background-color: #09639f;
-            cursor: pointer;
-            transition: background-color 0.3s ease;
-        }
-        button:hover {background-color: #2980b9;}
-        @media only screen and (min-width: 768px) {
-            .container { width: 30%; }
-        }
-    </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>BPB Panel <span style="font-size: smaller;">2.3</span> 💦</h1>
-            <div class="form-container">
-                <h2>User Login</h2>
-                <form id="loginForm">
-                    <div class="form-control">
-                        <label for="password">Password</label>
-                        <input type="password" id="password" name="password" required>
-                    </div>
-                    <div id="passwordError" style="color: red; margin-bottom: 10px;"></div>
-                    <button type="submit" class="button">Login</button>
-                </form>
-            </div>
-        </div>
-    <script>
-        document.getElementById('loginForm').addEventListener('submit', async (event) => {
-            event.preventDefault();
-            const password = document.getElementById('password').value;
-
-            try {
-                const response = await fetch('/login', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'text/plain'
-                    },
-                    body: password
-                });
-            
-                if (response.ok) {
-                    window.location.href = '/panel';
-                } else {
-                    passwordError.textContent = '⚠️ Wrong Password!';
-                    const errorMessage = await response.text();
-                    console.error('Login failed:', errorMessage);
-                }
-            } catch (error) {
-                console.error('Error during login:', error);
-            }
-        });
-    </script>
-    </body>
-    </html>`;
-
-    return html;
-}
-
-const xrayConfigTemp = {
-    remarks: "",
-    dns: {
-        hosts: {
-            "geosite:category-ads-all": "127.0.0.1",
-            "geosite:category-ads-ir": "127.0.0.1",
-            "domain:googleapis.cn": "googleapis.com"
-        },
-        servers: [
-            "",
-            {
-                address: "",
-                domains: ["geosite:private", "geosite:category-ir", "domain:.ir"],
-                expectIPs: ["geoip:cn"],
-                port: 53
-            },
-        ],
-        queryStrategy: "UseIP",
-        tag: "dns"
-    },
-    inbounds: [
-        {
-            port: 10808,
-            protocol: "socks",
-            settings: {
-                auth: "noauth",
-                udp: true,
-                userLevel: 8,
-            },
-            sniffing: {
-                destOverride: ["http", "tls", "fakedns"],
-                enabled: true,
-            },
-            tag: "socks",
-        },
-        {
-            port: 10809,
-            protocol: "http",
-            settings: {
-                userLevel: 8,
-            },
-            tag: "http",
-        },
-    ],
-    log: {
-        loglevel: "warning",
-    },
-    outbounds: [
-        {
-            protocol: "freedom",
-            settings: {
-                domainStrategy: "UseIP",
-            },
-            tag: "direct",
-        },
-        {
-            protocol: "blackhole",
-            settings: {
-                response: {
-                    type: "http",
-                },
-            },
-            tag: "block",
-        },
-        {
-            tag: "fragment",
-            protocol: "freedom",
-            settings: {
-                fragment: {
-                    packets: "tlshello",
-                    length: "",
-                    interval: "",
-                },
-            },
-            streamSettings: {
-                sockopt: {
-                    tcpKeepAliveIdle: 100
-                },
-            },
-        }
-    ],
-    policy: {
-        levels: {
-            8: {
-                connIdle: 300,
-                downlinkOnly: 1,
-                handshake: 4,
-                uplinkOnly: 1,
-            },
-        },
-        system: {
-            statsOutboundUplink: true,
-            statsOutboundDownlink: true,
-        },
-    },
-    routing: {
-        domainStrategy: "IPIfNonMatch",
-        rules: [
-            {
-                ip: [],
-                outboundTag: "direct",
-                port: "53",
-                type: "field",
-            },
-            {
-                domain: ["geosite:private", "geosite:category-ir", "domain:.ir"],
-                outboundTag: "direct",
-                type: "field",
-            },
-            {
-                ip: ["geoip:private", "geoip:ir"],
-                outboundTag: "direct",
-                type: "field",
-            },
-            {
-                domain: ["geosite:category-ads-all", "geosite:category-ads-ir"],
-                outboundTag: "block",
-                type: "field",
-            },
-            {
-                balancerTag: "all",
-                type: "field",
-                network: "tcp,udp",
-            }
-        ],
-        balancers: [
-            {
-                tag: "all",
-                selector: ["proxy"],
-                strategy: {
-                    type: "leastPing",
-                },
-            },
-        ],
-    },
-    observatory: {
-        probeInterval: "3m",
-        probeURL: "https://api.github.com/_private/browser/stats",
-        subjectSelector: ["proxy"],
-        EnableConcurrency: true,
-    },
-    stats: {},
-};
-
-const xrayOutboundTemp = 
-{
-    mux: {
-        concurrency: 8,
-        enabled: true,
-        xudpConcurrency: 8,
-        xudpProxyUDP443: "reject"
-    },
-    protocol: "vless",
-    settings: {
-        vnext: [
-            {
-                address: "",
-                port: 443,
-                users: [
-                    {
-                        encryption: "none",
-                        flow: "",
-                        id: "",
-                        level: 8,
-                        security: "auto"
-                    }
-                ]
-            }
-        ]
-    },
-    streamSettings: {
-        network: "ws",
-        security: "tls",
-        sockopt: {
-            dialerProxy: "fragment",
-            tcpKeepAliveIdle: 100
-        },
-        tlsSettings: {
-            allowInsecure: false,
-            fingerprint: "chrome",
-            alpn: ["h2", "http/1.1"],
-            serverName: ""
-        },
-        wsSettings: {
-            headers: {
-                Host: ""
-            },
-            path: ""
-        },
-        grpcSettings: {
-            authority: "",
-            multiMode: false,
-            serviceName: ""
-        },
-        realitySettings: {
-            fingerprint: "",
-            publicKey: "",
-            serverName: "",
-            shortId: "",
-            spiderX: ""
-        },
-        tcpSettings: {
-            header: {
-                request: {
-                    headers: {
-                        Host: []
-                    },
-                    method: "GET",
-                    path: [],
-                    version: "1.1"
-                },
-                response: {
-                    headers: {
-                        "Content-Type": ["application/octet-stream"]
-                    },
-                    reason: "OK",
-                    status: "200",
-                    version: "1.1"
-                },
-                type: "http"
-            }
-          }
-    },
-    tag: "proxy"
-};
-
-const singboxConfigTemp = {
-    log: {
-        level: "warn",
-        timestamp: true
-    },
-    dns: {
-        servers: [
-            {
-                tag: "dns-remote",
-                address: "https://8.8.8.8/dns-query",
-                address_resolver: "dns-direct"
-            },
-            {
-                tag: "dns-direct",
-                address: "8.8.8.8",
-                address_resolver: "dns-local",
-                detour: "direct"
-            },
-            {
-                tag: "dns-local",
-                address: "local",
-                detour: "direct"
-            },
-            {
-                tag: "dns-block",
-                address: "rcode://success"
-            }
-        ],
-        rules: [
-            {
-                domain_suffix: [".ir"],
-                server: "dns-direct"
-            },
-            {
-                outbound: "direct",
-                server: "dns-direct"
-            },
-            {
-                outbound: "any",
-                server: "dns-direct"
-            }
-        ],
-        strategy: "ipv4_only",
-        independent_cache: true
-    },
-    inbounds: [
-        {
-            type: "direct",
-            tag: "dns-in",
-            listen: "127.0.0.1",
-            listen_port: 6450,
-            override_address: "8.8.8.8",
-            override_port: 53
-        },
-        {
-            type: "tun",
-            tag: "tun-in",
-            mtu: 9000,
-            inet4_address: "172.19.0.1/28",
-            auto_route: true,
-            strict_route: true,
-            endpoint_independent_nat: true,
-            stack: "mixed",
-            sniff: true,
-            sniff_override_destination: false
-        },
-        {
-            type: "mixed",
-            tag: "mixed-in",
-            listen: "127.0.0.1",
-            listen_port: 2080,
-            sniff: true,
-            sniff_override_destination: false
-        }
-    ],
-    outbounds: [
-        {
-            type: "selector",
-            tag: "proxy",
-            outbounds: ["URL-TEST"]
-        },
-        {
-            type: "urltest",
-            tag: "URL-TEST",
-            outbounds: [],
-            url: "https://www.gstatic.com/generate_204",
-            interval: "3m",
-            tolerance: 50
-        },
-        {
-            type: "direct",
-            tag: "direct"
-        },
-        {
-            type: "block",
-            tag: "block"
-        },
-        {
-            type: "dns",
-            tag: "dns-out"
-        }
-    ],
-    route: {
-        rules: [
-            {
-                port: 53,
-                outbound: "dns-out"
-            },
-            {
-                inbound: "dns-in",
-                outbound: "dns-out"
-            },
-            {
-                network: "udp",
-                port: 443,
-                port_range: [],
-                outbound: "block"
-            },
-            {
-                ip_is_private: true,
-                outbound: "direct"
-            },
-            {
-                rule_set: [
-                    "geosite-category-ads-all",
-                    "geosite-malware",
-                    "geosite-phishing",
-                    "geosite-cryptominers",
-                    "geoip-malware",
-                    "geoip-phishing"
-                ],
-                outbound: "block"
-            },
-            {
-                rule_set: ["geosite-ir", "geoip-ir"],
-                outbound: "direct"
-            },
-            {
-                ip_cidr: ["224.0.0.0/3", "ff00::/8"],
-                source_ip_cidr: ["224.0.0.0/3", "ff00::/8"],
-                outbound: "block"
-            }
-        ],
-        rule_set: [
-            {
-                type: "remote",
-                tag: "geosite-ir",
-                format: "binary",
-                url: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-ir.srs",
-                download_detour: "direct"
-            },
-            {
-                type: "remote",
-                tag: "geosite-category-ads-all",
-                format: "binary",
-                url: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-category-ads-all.srs",
-                download_detour: "direct"
-            },
-            {
-                type: "remote",
-                tag: "geosite-malware",
-                format: "binary",
-                url: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-malware.srs",
-                download_detour: "direct"
-            },
-            {
-                type: "remote",
-                tag: "geosite-phishing",
-                format: "binary",
-                url: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-phishing.srs",
-                download_detour: "direct"
-            },
-            {
-                type: "remote",
-                tag: "geosite-cryptominers",
-                format: "binary",
-                url: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-cryptominers.srs",
-                download_detour: "direct"
-            },
-            {
-                type: "remote",
-                tag: "geoip-ir",
-                format: "binary",
-                url: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geoip-ir.srs",
-                download_detour: "direct"
-            },
-            {
-                type: "remote",
-                tag: "geoip-malware",
-                format: "binary",
-                url: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geoip-malware.srs",
-                download_detour: "direct"
-            },
-            {
-                type: "remote",
-                tag: "geoip-phishing",
-                format: "binary",
-                url: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geoip-phishing.srs",
-                download_detour: "direct"
-            }
-        ],
-        auto_detect_interface: true,
-        override_android_vpn: true,
-        final: "proxy"
-    },
-    experimental: {
-        clash_api: {
-            external_controller: "0.0.0.0:9090",
-            external_ui: "yacd",
-            external_ui_download_url: "https://github.com/MetaCubeX/Yacd-meta/archive/gh-pages.zip",
-            external_ui_download_detour: "direct",
-            secret: "",
-            default_mode: "rule"
-        }
-    }
-};
-
-const singboxOutboundTemp = {
-    type: "vless",
-    server: "",
-    server_port: 443,
-    uuid: userID,
-    domain_strategy: "prefer_ipv6",
-    packet_encoding: "",
-    tls: {
-        alpn: [
-            "http/1.1"
-        ],
-        enabled: true,
-        insecure: false,
-        server_name: "",
-        utls: {
-            enabled: true,
-            fingerprint: "randomized"
-        }
-    },
-    transport: {
-        early_data_header_name: "Sec-WebSocket-Protocol",
-        headers: {
-            Host: ""
-        },
-        max_early_data: 2048,
-        path: "/",
-        type: "ws"
-    },
-    tag: ""
-};
-
-const errorPage = `
-    <!DOCTYPE html>
-    <html lang="en">
-
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Error Page</title>
-        <style>
-            body,
-            html {
-                height: 100%;
-                margin: 0;
-                display: flex;
-                justify-content: center;
-                align-items: center;
-                font-family: system-ui;
-            }
-            h1 {
-                text-align: center;
-                color: #2980b9;
-                font-size: 2.5rem;
-            }
-            #error-container {
-                text-align: center;
-            }
-        </style>
-    </head>
-
-    <body>
-        <div id="error-container">
-            <h1>BPB Panel <span style="font-size: smaller;">2.3</span> 💦</h1>
-            <div id="error-message">
-                <h2>KV Dataset is not properly set! Please refer to <a href="https://github.com/bia-pain-bache/BPB-Worker-Panel/blob/main/README.md">documents</a></h2>
-            </div>
-        </div>
-    </body>
-
-    </html>`;
+const cn_hostnames = [
+	'weibo.com',                // Weibo - A popular social media platform
+	'www.baidu.com',            // Baidu - The largest search engine in China
+	'www.qq.com',               // QQ - A widely used instant messaging platform
+	'www.taobao.com',           // Taobao - An e-commerce website owned by Alibaba Group
+	'www.jd.com',               // JD.com - One of the largest online retailers in China
+	'www.sina.com.cn',          // Sina - A Chinese online media company
+	'www.sohu.com',             // Sohu - A Chinese internet service provider
+	'www.tmall.com',            // Tmall - An online retail platform owned by Alibaba Group
+	'www.163.com',              // NetEase Mail - One of the major email providers in China
+	'www.zhihu.com',            // Zhihu - A popular question-and-answer website
+	'www.youku.com',            // Youku - A Chinese video sharing platform
+	'www.xinhuanet.com',        // Xinhua News Agency - Official news agency of China
+	'www.douban.com',           // Douban - A Chinese social networking service
+	'www.meituan.com',          // Meituan - A Chinese group buying website for local services
+	'www.toutiao.com',          // Toutiao - A news and information content platform
+	'www.ifeng.com',            // iFeng - A popular news website in China
+	'www.autohome.com.cn',      // Autohome - A leading Chinese automobile online platform
+	'www.360.cn',               // 360 - A Chinese internet security company
+	'www.douyin.com',           // Douyin - A Chinese short video platform
+	'www.kuaidi100.com',        // Kuaidi100 - A Chinese express delivery tracking service
+	'www.wechat.com',           // WeChat - A popular messaging and social media app
+	'www.csdn.net',             // CSDN - A Chinese technology community website
+	'www.imgo.tv',              // ImgoTV - A Chinese live streaming platform
+	'www.aliyun.com',           // Alibaba Cloud - A Chinese cloud computing company
+	'www.eyny.com',             // Eyny - A Chinese multimedia resource-sharing website
+	'www.mgtv.com',             // MGTV - A Chinese online video platform
+	'www.xunlei.com',           // Xunlei - A Chinese download manager and torrent client
+	'www.hao123.com',           // Hao123 - A Chinese web directory service
+	'www.bilibili.com',         // Bilibili - A Chinese video sharing and streaming platform
+	'www.youth.cn',             // Youth.cn - A China Youth Daily news portal
+	'www.hupu.com',             // Hupu - A Chinese sports community and forum
+	'www.youzu.com',            // Youzu Interactive - A Chinese game developer and publisher
+	'www.panda.tv',             // Panda TV - A Chinese live streaming platform
+	'www.tudou.com',            // Tudou - A Chinese video-sharing website
+	'www.zol.com.cn',           // ZOL - A Chinese electronics and gadgets website
+	'www.toutiao.io',           // Toutiao - A news and information app
+	'www.tiktok.com',           // TikTok - A Chinese short-form video app
+	'www.netease.com',          // NetEase - A Chinese internet technology company
+	'www.cnki.net',             // CNKI - China National Knowledge Infrastructure, an information aggregator
+	'www.zhibo8.cc',            // Zhibo8 - A website providing live sports streams
+	'www.zhangzishi.cc',        // Zhangzishi - Personal website of Zhang Zishi, a public intellectual in China
+	'www.xueqiu.com',           // Xueqiu - A Chinese online social platform for investors and traders
+	'www.qqgongyi.com',         // QQ Gongyi - Tencent's charitable foundation platform
+	'www.ximalaya.com',         // Ximalaya - A Chinese online audio platform
+	'www.dianping.com',         // Dianping - A Chinese online platform for finding and reviewing local businesses
+	'www.suning.com',           // Suning - A leading Chinese online retailer
+	'www.zhaopin.com',          // Zhaopin - A Chinese job recruitment platform
+	'www.jianshu.com',          // Jianshu - A Chinese online writing platform
+	'www.mafengwo.cn',          // Mafengwo - A Chinese travel information sharing platform
+	'www.51cto.com',            // 51CTO - A Chinese IT technical community website
+	'www.qidian.com',           // Qidian - A Chinese web novel platform
+	'www.ctrip.com',            // Ctrip - A Chinese travel services provider
+	'www.pconline.com.cn',      // PConline - A Chinese technology news and review website
+	'www.cnzz.com',             // CNZZ - A Chinese web analytics service provider
+	'www.telegraph.co.uk',      // The Telegraph - A British newspaper website	
+	'www.ynet.com',             // Ynet - A Chinese news portal
+	'www.ted.com',              // TED - A platform for ideas worth spreading
+	'www.renren.com',           // Renren - A Chinese social networking service
+	'www.pptv.com',             // PPTV - A Chinese online video streaming platform
+	'www.liepin.com',           // Liepin - A Chinese online recruitment website
+	'www.881903.com',           // 881903 - A Hong Kong radio station website
+	'www.aipai.com',            // Aipai - A Chinese online video sharing platform
+	'www.ttpaihang.com',        // Ttpaihang - A Chinese celebrity popularity ranking website
+	'www.quyaoya.com',          // Quyaoya - A Chinese online ticketing platform
+	'www.91.com',               // 91.com - A Chinese software download website
+	'www.dianyou.cn',           // Dianyou - A Chinese game information website
+	'www.tmtpost.com',          // TMTPost - A Chinese technology media platform
+	'www.douban.com',           // Douban - A Chinese social networking service
+	'www.guancha.cn',           // Guancha - A Chinese news and commentary website
+	'www.so.com',               // So.com - A Chinese search engine
+	'www.58.com',               // 58.com - A Chinese classified advertising website
+	'www.cnblogs.com',          // Cnblogs - A Chinese technology blog community
+	'www.cntv.cn',              // CCTV - China Central Television official website
+	'www.secoo.com',            // Secoo - A Chinese luxury e-commerce platform
+];
